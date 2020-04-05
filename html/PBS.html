@@ -1,0 +1,1795 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>Physically Based Shader</title>
+		<style>
+			html, body {
+				width: 100%;
+				height: 100%;
+			}
+			body {
+				background-color: #ffffff;
+				margin: 0;
+				overflow: hidden;
+				font-family: arial;
+			}
+		</style>
+
+		<script id="vs" type="x-shader/x-vertex">
+			uniform mat4 uViewMatrixInverse;
+			uniform vec3 directionalLightDirection;
+			attribute vec4 tangent;
+			varying vec4 vWorldPosition;
+			varying vec3 vEye;
+			varying vec3 vNormal;
+			varying vec3 vLightDir;
+			varying vec2 vUV;
+			varying mat3 TBNmatrix;
+
+			// shadowMap_pars_vertex
+			#ifdef USE_SHADOWMAP
+				varying vec4 vShadowCoord[ MAX_SHADOWS ];
+				uniform mat4 shadowMatrix[ MAX_SHADOWS ];
+			#endif
+			//
+
+		    void main() {
+ 
+		    	vUV = uv ;
+
+		    	// calcolo dei vettori nel WORLD-SPACE
+		    	vec4 worldPosition = modelMatrix * vec4(position,1.0);
+		    	vec3 normalDirectionVS = normalMatrix*normal;
+		    	vNormal = normalize( vec3( uViewMatrixInverse * vec4(normalDirectionVS,0.0) ) );
+		    	vLightDir = directionalLightDirection;
+		    	vEye = normalize( cameraPosition - worldPosition.xyz );
+
+		    	vWorldPosition = worldPosition;
+
+		    	// Calcolo matrice per la normal map
+		    	// In questo modo, la matrice TBN definisce il passaggio dal TS al WS
+		    	vec3 N = normalize( vNormal );
+		    	vec3 T = normalize( vec3(modelMatrix*tangent) );
+		    	vec3 B = normalize( cross(N,T) );
+
+		    	TBNmatrix = mat3(T,B,N);
+
+		    	// shadowMap_vertex
+		    	#ifdef USE_SHADOWMAP
+		    		for( int i = 0; i < MAX_SHADOWS; i ++ ) { vShadowCoord[ i ] = shadowMatrix[ i ] * worldPosition; }
+	    		#endif
+				//
+
+		    	gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+
+		    }
+		</script>
+
+		<script id="fs" type="x-shader/x-fragment">
+			#extension GL_EXT_shader_texture_lod : enable	
+
+			float PI = 3.1415926535;
+			uniform samplerCube cubeMap;
+			uniform samplerCube irrMap;
+			uniform samplerCube pmrem;
+			uniform sampler2D normalMap;
+			uniform sampler2D diffuseMap;			
+			uniform sampler2D specularMap;
+			uniform sampler2D glossMap;
+			uniform sampler2D noiseMap;
+			uniform sampler2D occlusionMap;
+			uniform vec3 directionalLightColor;
+			uniform vec3 cDiff;
+			uniform vec3 f0;
+			uniform vec3 clearcoatF0;
+			uniform float rough;
+			uniform float roughGGX;
+			uniform float ambientFactorDiffuse;
+			uniform float ambientFactorSpecular;
+			uniform float clearcoat;
+			uniform float clearcoatGloss;
+			uniform float repeat;
+			uniform float sparkleAmount;
+			uniform float AOamount;
+			uniform int useShadowMap;
+			uniform int useNormalMap;
+			uniform int useDiffMap;
+			uniform int useSpecMap;
+			uniform int useGlossMap;
+			uniform int useNoiseMap;
+			uniform int useOcclusionMap;
+			varying vec4 vWorldPosition;
+			varying vec3 vEye;
+			varying vec3 vNormal;
+			varying vec3 vLightDir;
+			varying vec2 vUV;
+			varying mat3 TBNmatrix;
+
+			// shadowMap_pars_fragment
+			#ifdef USE_SHADOWMAP
+
+				uniform sampler2D shadowMap[ MAX_SHADOWS ];
+				uniform vec2 shadowMapSize[ MAX_SHADOWS ];
+
+				uniform float shadowDarkness[ MAX_SHADOWS ];
+				uniform float shadowBias[ MAX_SHADOWS ];
+
+				varying vec4 vShadowCoord[ MAX_SHADOWS ];
+
+				float unpackDepth( const in vec4 rgba_depth ) {
+
+					const vec4 bit_shift = vec4( 1.0 / ( 256.0 * 256.0 * 256.0 ), 1.0 / ( 256.0 * 256.0 ), 1.0 / 256.0, 1.0 );
+					float depth = dot( rgba_depth, bit_shift );
+					return depth;
+				}
+			#endif
+			//
+
+			vec3 calculateShadow(float cosTheta){
+
+				// shadowMap_fragment				
+				float fDepth;
+				vec3 shadowColor = vec3( 1.0 );
+
+				for( int i = 0; i < MAX_SHADOWS; i ++ ) {
+
+					vec3 shadowCoord = vShadowCoord[ i ].xyz / vShadowCoord[ i ].w;
+
+					// don't shadow pixels outside of light frustum
+					bvec4 inFrustumVec = bvec4 ( shadowCoord.x >= 0.0, shadowCoord.x <= 1.0, shadowCoord.y >= 0.0, shadowCoord.y <= 1.0 );
+					bool inFrustum = all( inFrustumVec );
+
+					// don't shadow pixels behind far plane of light frustum
+					bvec2 frustumTestVec = bvec2( inFrustum, shadowCoord.z <= 1.0 );
+					bool frustumTest = all( frustumTestVec );
+
+					if ( frustumTest ) {
+
+						// codice con il bias ---> http://www.opengl-tutorial.org/intermediate-tutorials/tutorial-16-shadow-mapping/
+						cosTheta = clamp( cosTheta , 0.0 , 1.0 );
+						float _shadowBias = -shadowBias[i];	// la shadowmap di Three.js di default somma lo shadowBias allo shadowCoord.z, per cui per la mia scena va bene il valore negativo -0.005
+															// Però per questa formula lo shadowBias deve essere positivo, ovvero 0.005. Quindi qui ho dovuto mettere il meno in quanto lo shadowBias 
+															// deve essere uguale per tutta la scena. Quindi per tutta la scena va bene -0.005 (perchè usa la shadowMap di default), invece per questo shader
+															// io uso +0.005 perchè faccio shadowCoord.z -= bias (invece che +=). 
+						float bias = _shadowBias * clamp( sqrt(1.0 - pow( cosTheta, 2.0) ) / cosTheta, 0.0, 3.0);	// è equivalente a tan( acos(cosTheta) ) ed è più efficiente
+
+						//shadowCoord.z += shadowBias[ i ];
+						shadowCoord.z -= bias;
+
+						#if defined( SHADOWMAP_TYPE_PCF )
+						// Percentage-close filtering (9 pixel kernel)
+
+							float shadow = 0.0;
+							/*
+									// nested loops breaks shader compiler / validator on some ATI cards when using OpenGL
+									// must enroll loop manually
+
+							for ( float y = -1.25; y <= 1.25; y += 1.25 )
+								for ( float x = -1.25; x <= 1.25; x += 1.25 ) {
+
+									vec4 rgbaDepth = texture2D( shadowMap[ i ], vec2( x * xPixelOffset, y * yPixelOffset ) + shadowCoord.xy );
+
+											// doesn't seem to produce any noticeable visual difference compared to simple texture2D lookup
+											//vec4 rgbaDepth = texture2DProj( shadowMap[ i ], vec4( vShadowCoord[ i ].w * ( vec2( x * xPixelOffset, y * yPixelOffset ) + shadowCoord.xy ), 0.05, vShadowCoord[ i ].w ) );
+
+									float fDepth = unpackDepth( rgbaDepth );
+
+									if ( fDepth < shadowCoord.z )
+										shadow += 1.0;
+
+							}
+
+							shadow /= 9.0;
+							*/
+
+							const float shadowDelta = 1.0 / 9.0;
+
+							float xPixelOffset = 1.0 / shadowMapSize[ i ].x;
+							float yPixelOffset = 1.0 / shadowMapSize[ i ].y;
+
+							float dx0 = -1.25 * xPixelOffset;
+							float dy0 = -1.25 * yPixelOffset;
+							float dx1 = 1.25 * xPixelOffset;
+							float dy1 = 1.25 * yPixelOffset;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, dy0 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( 0.0, dy0 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, dy0 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, 0.0 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, 0.0 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, dy1 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( 0.0, dy1 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							fDepth = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, dy1 ) ) );
+							if ( fDepth < shadowCoord.z ) shadow += shadowDelta;
+
+							shadowColor = shadowColor * vec3( ( 1.0 - shadowDarkness[ i ] * shadow ) );
+
+						#elif defined( SHADOWMAP_TYPE_PCF_SOFT )
+						// Percentage-close filtering (9 pixel kernel)
+
+							float shadow = 0.0;
+
+							float xPixelOffset = 1.0 / shadowMapSize[ i ].x;
+							float yPixelOffset = 1.0 / shadowMapSize[ i ].y;
+
+							float dx0 = -1.0 * xPixelOffset;
+							float dy0 = -1.0 * yPixelOffset;
+							float dx1 = 1.0 * xPixelOffset;
+							float dy1 = 1.0 * yPixelOffset;
+
+							mat3 shadowKernel;
+							mat3 depthKernel;
+
+							depthKernel[0][0] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, dy0 ) ) );
+							depthKernel[0][1] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, 0.0 ) ) );
+							depthKernel[0][2] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx0, dy1 ) ) );
+							depthKernel[1][0] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( 0.0, dy0 ) ) );
+							depthKernel[1][1] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy ) );
+							depthKernel[1][2] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( 0.0, dy1 ) ) );
+							depthKernel[2][0] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, dy0 ) ) );
+							depthKernel[2][1] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, 0.0 ) ) );
+							depthKernel[2][2] = unpackDepth( texture2D( shadowMap[ i ], shadowCoord.xy + vec2( dx1, dy1 ) ) );
+
+							vec3 shadowZ = vec3( shadowCoord.z );
+							shadowKernel[0] = vec3(lessThan(depthKernel[0], shadowZ ));
+							shadowKernel[0] *= vec3(0.25);
+
+							shadowKernel[1] = vec3(lessThan(depthKernel[1], shadowZ ));
+							shadowKernel[1] *= vec3(0.25);
+
+							shadowKernel[2] = vec3(lessThan(depthKernel[2], shadowZ ));
+							shadowKernel[2] *= vec3(0.25);
+
+							vec2 fractionalCoord = 1.0 - fract( shadowCoord.xy * shadowMapSize[i].xy );
+
+							shadowKernel[0] = mix( shadowKernel[1], shadowKernel[0], fractionalCoord.x );
+							shadowKernel[1] = mix( shadowKernel[2], shadowKernel[1], fractionalCoord.x );
+
+							vec4 shadowValues;
+							shadowValues.x = mix( shadowKernel[0][1], shadowKernel[0][0], fractionalCoord.y );
+							shadowValues.y = mix( shadowKernel[0][2], shadowKernel[0][1], fractionalCoord.y );
+							shadowValues.z = mix( shadowKernel[1][1], shadowKernel[1][0], fractionalCoord.y );
+							shadowValues.w = mix( shadowKernel[1][2], shadowKernel[1][1], fractionalCoord.y );
+
+							shadow = dot( shadowValues, vec4( 1.0 ) );
+
+							shadowColor = shadowColor * vec3( ( 1.0 - shadowDarkness[ i ] * shadow ) );
+
+						#else
+
+							vec4 rgbaDepth = texture2D( shadowMap[ i ], shadowCoord.xy );
+							float fDepth = unpackDepth( rgbaDepth );
+
+							if ( fDepth < shadowCoord.z )
+							// spot with multiple shadows is darker
+								shadowColor = shadowColor * vec3( 1.0 - shadowDarkness[ i ] );
+
+							// spot with multiple shadows has the same color as single shadow spot
+					 			//shadowColor = min( shadowColor, vec3( shadowDarkness[ i ] ) );
+
+						#endif
+
+					}
+
+				}		
+
+				return shadowColor;
+			}
+
+			// F(f0,l,h) Schlick
+			vec3 F_schlick(vec3 f0, vec3 l, vec3 h){
+
+				float LdotH = max( dot(l,h) , 0.0);
+				//float LdotH = abs( dot(l,h) );		
+													
+				return f0 + (1.0 - f0) * pow( (1.0 - LdotH ) , 5.0 );
+			}
+
+			// G(l,v,h) Cook-Torrance
+			float G_ct(vec3 l, vec3 v, vec3 h, vec3 n){
+
+				float LdotH = max( dot(l,h) , 0.0 );
+				float NdotL = max( dot(n,l) , 0.0 );
+	        	float NdotV = max( dot(n,v) , 0.0 );
+	        	float NdotH = max( dot(n,h) , 0.0 );
+
+	        	float g_ct = min( 1.0 , min(2.0*NdotH*NdotV/LdotH , 2.0*NdotH*NdotL/LdotH) );
+				return g_ct;
+			}
+
+			// G(l,v,h) Cook-Torrance with Kelemen approximation
+			float G_ct_KelemenApprox(vec3 l, vec3 v, vec3 h, vec3 n){
+
+				float LdotH = max( dot(l,h) , 0.0);
+				float NdotL = max( dot(n,l) , 0.0);
+	        	float NdotV = max( dot(n,v) , 0.0);
+				return NdotL * NdotV / pow( LdotH , 2.0 );
+			}
+
+			// D(h) Phong
+			float D_phong(vec3 h, vec3 n, float roughness){
+
+				float NdotH = max( dot(n,h) , 0.0);
+				//float alpha = pow( 2048.0 , roughness );
+				float alpha = ( 2.0 / pow(roughness,2.0) ) - 2.0;
+				return ( (alpha + 2.0) / 2.0*PI ) * pow( NdotH , alpha );
+			}
+
+			// D(h) of Trowbridge-Reitz, also know as GGX distribution
+			float D_TrowbridgeReitz(vec3 h, vec3 n, float roughness){
+
+				float NdotH = max( dot(n,h) , 0.0);
+				float NdotH2 = NdotH*NdotH;
+				float alpha = roughness*roughness;
+				float alpha2 = alpha*alpha;
+				
+				return alpha2 / ( PI * pow( ( NdotH2*( alpha2 - 1.0 ) + 1.0 ) , 2.0 ) ); 
+
+			}
+
+			// diffusive BRDF Lambert
+			vec3 BRDF_Lambert(vec3 cDiff){ return cDiff/PI; }
+
+			// specular BRDF Cook-Torrance
+			vec3 BRDF_CookTorrance(vec3 l, vec3 v, vec3 n, vec3 f0, float roughness){
+
+				vec3 specular;
+				vec3 h = normalize(l+v);
+
+				//float NdotL = max( dot(n,l) , 0.0);
+	        	//float NdotV = max( dot(n,v) , 0.0);
+	        	float LdotH = max( dot(l,h) , 0.0);
+	        	float LdotH2 = LdotH*LdotH;
+
+	        	vec3 F = F_schlick(f0,l,h);
+	        	float G = G_ct_KelemenApprox(l,v,h,n);	// G_ct(l,v,h,n)
+	        	float D = D_TrowbridgeReitz(h,n,roughness);	// D_phong(h,n,roughness)
+
+				//specular = F * G * D / ( 4.0 * NdotL * NdotV );
+				//specular = F * D / 4.0;	// G implicita
+				
+				// G Kelemen approximation 
+				// sostituisce la G al numeratore e (n,l)(n,v) al denominatore
+				specular = F * D / ( 4.0 * LdotH2 );
+				
+				return specular;
+			}
+
+	        void main() {
+
+	        	vec3 radiance;
+	        	vec3 _worldNormal;
+	        	vec3 _worldNormalCoat;
+	        	vec3 _cDiff;
+	        	vec3 _f0;
+	        	vec3 _directionalLightColor = directionalLightColor;
+	        	vec3 occlusion;
+	        	float _roughGGX;
+	        	float gamma = 2.2;	// per i monitor tipicamente è 2.2
+
+	        	_worldNormal = normalize(vNormal);
+
+	        	// SHADING TEXTURES
+	         	// if(useOcclusionMap==1){
+				// 	float att = 1.0 / AOamount;
+				// 	occlusion = pow( texture2D( occlusionMap , vUV ).xyz , vec3(att) );
+				// 	_directionalLightColor += occlusion;
+				// }
+
+	        	if(useNormalMap==1){
+
+		        	vec3 normalPerturb = normalize( texture2D(normalMap, vUV).rgb * 2.0 - vec3(1.0) ); // Calcolo normale perturbata (nel WORLD-SPACE)
+		        	normalPerturb = TBNmatrix * normalPerturb;
+		        	_worldNormal = normalize(normalPerturb);	// shading with NORMAL-MAP
+	        	}
+
+	        	_worldNormalCoat = _worldNormal;
+
+	        	if(useNoiseMap==1){
+
+	        		vec3 normalPerturb = normalize( texture2D( noiseMap , repeat * vUV ).rgb * 2.0 - vec3(1.0) );
+	        		normalPerturb = normalize( TBNmatrix * normalPerturb );
+	        		float distance = length( cameraPosition - vWorldPosition.xyz );
+	        		_worldNormal = normalize( max(distance,1.0) * ( TBNmatrix * vec3(0.0,0.0,1.0) ) + _worldNormal + sparkleAmount * normalPerturb ); 
+	        		//_worldNormal = normalize( _worldNormal + sparkleAmount * normalPerturb );	        		        	
+	        	}
+
+	        	if(useDiffMap==1){ 	_cDiff = 	pow( vec3( texture2D( diffuseMap , vUV ) ) 	, vec3(gamma) ); 	}else{ _cDiff = cDiff; } 
+	        	//if(useSpecMap==1){ 	_f0 = 		pow( vec3( texture2D( specularMap , vUV ) ) , vec3(gamma) ); 	}else{ _f0 = f0; }
+	        	//if(useGlossMap==1){	_roughGGX = pow( texture2D( glossMap , vUV ).x 			, gamma ); 			}else{ _roughGGX = roughGGX; }
+	        	if(useSpecMap==1){ 	_f0 = 		vec3( texture2D( specularMap , vUV ) );	}else{ _f0 = f0; }
+	        	if(useGlossMap==1){	_roughGGX = texture2D( glossMap , vUV ).x; 			}else{ _roughGGX = roughGGX; }
+        		//
+
+	        	vec3 halfVector = normalize( vLightDir + vEye );
+	        	vec3 reflected = normalize( reflect( -vEye, _worldNormal) );	// uso -vEye perchè reflect vuole il vettore entrante al punto, mentre per il resto mi serve sempre uscente
+	        	float NdotL = max( dot( _worldNormal , vLightDir ) , 0.0);
+
+	        	if(NdotL>0.0){
+
+	        		vec3 cDiffCorrect = ( 1.0 - F_schlick( _f0 , vLightDir , halfVector ) ) * _cDiff;
+
+	        		vec3 diffuse = BRDF_Lambert( cDiffCorrect );
+	        		vec3 specular = BRDF_CookTorrance(vLightDir, vEye, _worldNormal, _f0, _roughGGX);
+
+	        		radiance = PI * ( diffuse + specular ) * NdotL * _directionalLightColor;
+
+	        	}				
+				
+				// SHADOWS
+				if(useShadowMap==1){
+
+					vec3 shadow = calculateShadow(NdotL);
+
+					if(useOcclusionMap==1){
+						occlusion = texture2D( occlusionMap , vUV ).xyz;
+						shadow += AOamount * occlusion;
+						shadow = clamp( shadow , 0.0 , 1.0 );
+					}
+
+					radiance = radiance * shadow;
+					//gl_FragColor = vec4(shadow,1.0);	// debug shadows
+				}
+	        	
+	        	float nU = 5.0; // numero di mipmap utili
+	        	float mipmapIndex = _roughGGX * ( nU - 1.0 ); // level of mipmap lineare: gloss * ( numMipmapUtili - 1 )        	
+
+	        	vec3 FAmbient =  F_schlick( _f0 , vEye , _worldNormal );
+
+	        	vec3 ambientDiffuse = ambientFactorDiffuse * 	pow( textureCube( irrMap , vec3( -_worldNormal.x , _worldNormal.yz ) ).xyz , vec3(gamma) ) 				* _cDiff * ( 1.0 - FAmbient );
+	        	vec3 ambientSpecular = ambientFactorSpecular * 	pow( textureCubeLodEXT( pmrem , vec3( -reflected.x, reflected.yz ) , mipmapIndex ).xyz , vec3(gamma) ) 	* FAmbient;
+ 
+	        	radiance += ambientDiffuse + ambientSpecular;
+
+	        	// CLEARCOAT
+	        	vec3 clearcoatEffect = vec3(0.0);
+	        	if(clearcoat!=0.0){
+
+	        		float LdotH = max( dot(vLightDir,halfVector), 0.0 );
+	        		float LdotH2 = LdotH*LdotH;
+
+	        		vec3 reflectedCoat = normalize( reflect( -vEye, _worldNormalCoat) );
+
+	        		vec3 Fclearcoat = F_schlick( clearcoatF0 , vLightDir , halfVector);
+	        		float Dclearcoat = D_TrowbridgeReitz(halfVector, _worldNormalCoat, clearcoatGloss);
+
+	        		clearcoatEffect = 	0.25 * clearcoat * PI * ( Dclearcoat * NdotL * _directionalLightColor / ( 4.0 * LdotH2 ) 
+	        							+ textureCubeLodEXT( pmrem , vec3( -reflectedCoat.x, reflectedCoat.yz ) , clearcoatGloss*(nU - 1.0) ).xyz )	
+	        							* Fclearcoat;
+
+	        		radiance += clearcoatEffect;
+	        	}
+
+				vec3 radianceGammaCorrected = vec3( pow( max(radiance,0.0) , vec3(1.0 / gamma) ) );
+
+				if(useOcclusionMap==1){ 
+					float att = pow( 0.1 , 1.0-AOamount );
+					occlusion = pow( texture2D( occlusionMap , vUV ).xyz , vec3(att) );
+	         		radianceGammaCorrected *= occlusion; 
+				}
+
+				// gl_FragColor = vec4( radianceGammaCorrected , 1.0 );
+				gl_FragColor = vec4( _worldNormal , 1.0 );	          
+		         
+			}
+	    </script>
+
+	    <script id="vs_glass" type="x-shader/x-vertex">
+	       	uniform mat4 uViewMatrixInverse;
+	    	varying float vAlpha;
+	    	varying vec3 vNormal;
+	    	varying vec3 vEye;
+
+		    // Indices of refraction
+			const float Air = 1.0;
+			const float Glass = 1.51714;
+			// Air to glass ratio of the indices of refraction (Eta)
+			const float Eta = Air / Glass;
+			// see http://en.wikipedia.org/wiki/Refractive_index Reflectivity
+			const float R0 = ((Air - Glass) * (Air - Glass)) / ((Air + Glass) * (Air + Glass));
+
+			// F(f0,l,h) Schlick
+			vec3 F_schlick(vec3 f0, vec3 l, vec3 h){
+
+				float LdotH = max( dot(l,h) , 0.0);													
+				return f0 + (1.0 - f0) * pow( (1.0 - LdotH ) , 5.0 );
+			}
+
+		    void main(){
+
+		    	// world-space
+		    	vec3 normalDirectionVS = normalMatrix*normal;
+		    	vNormal = normalize( vec3( uViewMatrixInverse * vec4(normalDirectionVS,0.0) ) );
+		    	vec4 worldPosition = modelMatrix * vec4(position,1.0);
+		    	vEye = normalize( cameraPosition - worldPosition.xyz );
+
+		    	vAlpha = F_schlick( vec3(R0), vEye, vNormal).x; 
+
+		    	gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+		    }
+	    </script>
+
+	    <script id="fs_glass" type="x-shader/x-fragment">
+	    	uniform samplerCube pmrem;
+		    varying float vAlpha;
+		    varying vec3 vNormal;
+	    	varying vec3 vEye;
+
+		    void main(){
+
+		    	vec3 reflect = normalize( reflect( normalize(-vEye), normalize(vNormal) ) );
+
+		    	// float gamma = 2.2;
+		    	// vec3 reflectedColor = pow( textureCubeLodEXT( pmrem, vec3( -reflect.x, reflect.yz ) , 0.0).xyz , vec3(gamma) ); 
+		    	vec3 reflectedColor = textureCubeLodEXT( pmrem, vec3( -reflect.x, reflect.yz ) , 0.0).xyz ; 
+
+		    	gl_FragColor = vec4(reflectedColor,vAlpha);
+		    }
+	    </script>
+		
+	</head>
+
+	<body>
+		<script src="../libs/three.min.js"></script>
+		<script src="../libs/OrbitControls.js"></script>
+		<script src="../libs/dat.gui.min.js"></script>
+		<script src="../libs/ColladaLoader.js"></script>
+		<script src="../libs/stats.min.js"></script>
+
+		<!-- Always needs all of these for postprocessing. -->
+		<script src="../libs/EffectComposer.js"></script>
+		<script src="../libs/RenderPass.js"></script>
+		<script src="../libs/ShaderPass.js"></script>
+		<script src="../libs/MaskPass.js"></script>
+
+		<script src="../libs/CopyShader.js"></script>
+		<script src="../libs/SSAOShader.js"></script>		
+		<!-- -->
+
+		<script>
+
+			var scene, camera, renderer, stats, composer, depthTarget, depthMaterial;
+			var controls, light;	
+			var myMaterial, myMaterial_chrome, myMaterial_glass, myMaterial_tyre, m;	
+			var myMaterial_faro, myMaterial_faro_post, myMaterial_black, myMaterial_logo, myMaterial_env, myMaterial_rim, myMaterial_disc;	
+			var dae, meshLoaded0, meshLoaded1, meshLoaded2, meshLoaded3, meshLoaded4, meshLoaded5, meshLoaded6, meshLoaded7, meshLoaded8, meshLoaded9;
+			var meshLoaded10, meshLoaded11, meshLoaded12, meshLoaded13, meshLoaded14, meshLoaded15, meshLoaded16;
+			var meshLoaded17, meshLoaded18, meshLoaded19, meshLoaded20, meshLoaded21, meshLoaded22, meshLoaded23, meshLoaded24, meshLoaded25;
+			var meshLoaded26, meshLoaded27, meshLoaded28, meshLoaded29, meshLoaded30, meshLoaded31, meshLoaded32, meshLoaded33;
+			
+            var loader = new THREE.ColladaLoader();
+			loader.options.convertUpAxis = true;
+
+			// BMW_1_forexport
+			loader.load( '../resources/models/BMW_1_forexport1.dae', function ( collada ) {
+				dae = collada.scene;
+				//dae.rotation.y = 180;
+				dae.traverse( function ( child ) {   
+					
+					if (child instanceof THREE.Mesh ){
+						child.castShadow = true;
+				    	child.receiveShadow = true;
+					}
+					//console.log(child);
+				    //if(child.name == 'Paraurti'){ meshLoaded0 = child.children[0]; }	// per caricare le mesh della BMW in base al nome dell'oggetto, che si trova in children[0]
+				    if(child.name == 'Body'){ meshLoaded1 = child.children[0]; }
+				    //if(child.name == 'Cofano'){ meshLoaded2 = child.children[0]; }
+				    //if(child.name == 'Door'){ meshLoaded3 = child.children[0]; }
+				    //if(child.name == 'Specchietti'){ meshLoaded4 = child.children[0]; }	
+				    if(child.name == 'Vetro_faro'){ meshLoaded5 = child.children[0]; }
+					//if(child.name == 'Paraurti_dietro'){ meshLoaded6 = child.children[0]; }
+					if(child.name == 'Vetro_front'){ meshLoaded7 = child.children[0]; }
+					if(child.name == 'Finestrini'){ meshLoaded8 = child.children[0]; }
+					if(child.name == 'Vetro_rear'){ meshLoaded9 = child.children[0]; }
+					if(child.name == 'Specchio'){ meshLoaded10 = child.children[0]; }
+					if(child.name == 'Mascherina'){ meshLoaded11 = child.children[0]; }
+					if(child.name == 'Griglia_frontale'){ meshLoaded12 = child.children[0]; }
+					//if(child.name == 'Cerchione_000'){ meshLoaded13 = child.children[0]; meshLoaded13.visible = false; }
+					if(child.name == 'Tyre_000'){ meshLoaded17 = child.children[0]; }
+					if(child.name == 'Tyre_001'){ meshLoaded18 = child.children[0]; }
+					if(child.name == 'Tyre_002'){ meshLoaded19 = child.children[0]; }
+					if(child.name == 'Tyre_003'){ meshLoaded20 = child.children[0]; }
+					if(child.name == 'Faro_interno'){ meshLoaded21 = child.children[0]; }
+					if(child.name == 'Vetro_faro_post'){ meshLoaded22 = child.children[0]; }
+					if(child.name == 'Faro_post'){ meshLoaded23 = child.children[0]; }
+					if(child.name == 'Griglia_sotto'){ meshLoaded24 = child.children[0]; }
+					if(child.name == 'Scarico'){ meshLoaded25 = child.children[0]; }
+					if(child.name == 'logofront'){ meshLoaded26 = child.children[0]; }
+					if(child.name == 'logorear'){ meshLoaded27 = child.children[0]; }
+					if(child.name == 'Cube'){ meshLoaded28 = child.children[0]; }
+					if(child.name == 'Plane'){ child.children[0].visible = false; }
+					if(child.name == 'Rim'){ meshLoaded29 = child.children[0]; }
+					if(child.name == 'Rim_001'){ meshLoaded14 = child.children[0]; }
+					if(child.name == 'Rim_002'){ meshLoaded15 = child.children[0]; }
+					if(child.name == 'Rim_003'){ meshLoaded16 = child.children[0]; }
+					if(child.name == 'Disc'){ meshLoaded30 = child.children[0]; }
+					if(child.name == 'Disc_001'){ meshLoaded31 = child.children[0]; }
+					if(child.name == 'Disc_002'){ meshLoaded32 = child.children[0]; }
+					if(child.name == 'Disc_003'){ meshLoaded33 = child.children[0]; }
+
+			    	// if (child instanceof THREE.Mesh ) {	meshLoaded0 = child; }	// To load di Suzanne (only one mesh)
+				} );
+				dae.updateMatrix();
+
+				init();
+				setupGui();
+				animate();
+
+			} );
+
+			// init();
+			// setupGui();
+			// animate();
+
+			function init() {
+
+				scene = new THREE.Scene();
+				scene.add(dae);
+
+				camera = new THREE.PerspectiveCamera( 45, window.innerWidth / window.innerHeight, 0.01, 2000 );
+				camera.position.set(1.7,0.7,2.3);
+
+				renderer = new THREE.WebGLRenderer();
+				//renderer = new THREE.WebGLRenderer( { antialias: true } );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				//renderer.setClearColor(0xffffff,1);
+				renderer.shadowMapEnabled = true;
+				renderer.shadowMapType = THREE.PCFSoftShadowMap;
+                renderer.shadowMapCullFace = THREE.CullFaceBack;	// This is needed to render shadows for only front-sided meshes
+                                                                    // In fact, default shadowmap work with the back-faces, but if the mesh doesn't have those
+                                                                    // this command is necessary.
+				renderer.gammaInput = true;
+				renderer.gammaOutput = true;
+				renderer.setBlending(THREE.NormalBlending, THREE.AddEquation, THREE.SrcAlphaFactor, THREE.OneMinusSrcAlphaFactor); // http://threejs.org/docs/#Reference/Constants/CustomBlendingEquation
+				renderer.context.getExtension('EXT_shader_texture_lod');	// Needed to use THREE.js extension
+				document.body.appendChild(renderer.domElement);
+
+				window.addEventListener('resize', onWindowResize, false);
+
+				// STATS
+				stats = new Stats();
+				stats.domElement.style.position = 'absolute';
+				stats.domElement.style.top = '0px';
+				stats.domElement.style.zIndex = 100;
+				document.body.appendChild(stats.domElement);
+                //
+
+				controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+				var path = "../resources/texture/studio_lights/st_";
+				var format = '.png';
+				var urls = [
+						path + 'px' + format, path + 'nx' + format,
+						path + 'py' + format, path + 'ny' + format,
+						path + 'pz' + format, path + 'nz' + format
+					];
+
+				var urlss = [
+					path + 'irr_px' + format, path + 'irr_nx' + format,
+					path + 'irr_py' + format, path + 'irr_ny' + format,
+					path + 'irr_pz' + format, path + 'irr_nz' + format
+				];
+
+                THREE.ImageUtils.crossOrigin = '';
+				var envCube = THREE.ImageUtils.loadTextureCube(urls);
+				envCube.format = THREE.RGBFormat;
+
+				var irrCube = THREE.ImageUtils.loadTextureCube(urlss);
+				irrCube.format = THREE.RGBFormat;
+
+				// ------------------------
+				// COMPRESSED TEXTURE DDS
+                // ------------------------
+                // THREE.js doesn't generate mipchain for dds files. If the .dds does not contains mipmap, it is necessary to set magFilter and minFilter
+                // If the .dds contains mipmaps, it is needed to disable filter to access mipmap levels
+
+				//var pmremMap = THREE.ImageUtils.loadCompressedTextureCube('OutputCube2.dds');
+				var pmremMap = THREE.ImageUtils.loadDDSTexture('studio_pmrem_1024.dds', new THREE.CubeReflectionMapping, function(cubemap) {
+					//pmremMap.magFilter = THREE.NearestFilter;
+					myMaterial.needsUpdate = true;
+					myMaterial_tyre.needsUpdate = true;
+					myMaterial_black.needsUpdate = true;
+					myMaterial_faro.needsUpdate = true;
+					myMaterial_faro_post.needsUpdate = true;
+					myMaterial_glass.needsUpdate = true;
+					myMaterial_rim.needsUpdate = true;
+					myMaterial_chrome.needsUpdate = true;
+					myMaterial_logo.needsUpdate = true;
+					myMaterial_env.needsUpdate = true;
+					myMaterial_disc.needsUpdate = true;
+				} );
+				// ----------------------------------
+
+				m = new THREE.Matrix4();
+				m = camera.matrixWorld;	// corrisponde all'inversa della viewMatrix, perchè camera.matrixWorldInverse mi da la viewMatrix
+
+				// ----------------------------------
+				// SET SHADER MATERIAL
+				// ----------------------------------
+				myMaterial = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	//cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.1) },
+														       		//f0: { type: 'v3' , value: new THREE.Vector3(1.0,0.71,0.29) }, // GOLD
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) }, // PLASTIC
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	//rough: { type: 'f' , value: 50.0 }, // 0 completely random microsurfaces, oo perfect mirror								        	
+														        	roughGGX: { type: 'f' , value: 0.5 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.7 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.5 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.5 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 0 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial.uniforms.cubeMap.value = envCube;
+				myMaterial.uniforms.irrMap.value = irrCube;
+				myMaterial.uniforms.pmrem.value = pmremMap;
+				myMaterial.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('');
+				myMaterial.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('');
+				myMaterial.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				myMaterial.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+
+				myMaterial.uniforms.noiseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/highFreqNormal.png');
+				myMaterial.uniforms.noiseMap.value.wrapT = myMaterial.uniforms.noiseMap.value.wrapS = THREE.RepeatWrapping;
+				myMaterial.uniforms.noiseMap.value.magFilter = myMaterial.uniforms.noiseMap.value.minFilter = THREE.NearestFilter;
+				myMaterial.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_body.png');
+				myMaterial.uniforms.occlusionMap.value.magFilter = myMaterial.uniforms.occlusionMap.value.minFilter = THREE.NearestFilter;
+			
+				// myMaterial for chrome
+				myMaterial_chrome = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.9,0.9,0.9) },
+														        	//f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) }, // PLASTIC
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	//rough: { type: 'f' , value: 50.0 }, // 0 completely random microsurfaces, oo perfect mirror									        	
+														        	roughGGX: { type: 'f' , value: 0.0 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.5 },
+														        	ambientFactorSpecular: { type: 'f' , value: 1.0 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 0 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_chrome.uniforms.cubeMap.value = envCube;
+				myMaterial_chrome.uniforms.irrMap.value = irrCube;
+				myMaterial_chrome.uniforms.pmrem.value = pmremMap;
+
+				// myMaterial for tyre
+				myMaterial_tyre = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+
+														        	roughGGX: { type: 'f' , value: 0.5 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.3 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.1 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 1 },
+														        	useDiffMap: { type: 'i' , value: 0 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_tyre.uniforms.cubeMap.value = envCube;
+				myMaterial_tyre.uniforms.irrMap.value = irrCube;
+				myMaterial_tyre.uniforms.pmrem.value = pmremMap;
+				myMaterial_tyre.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/normal_tyreGOD.png');
+				myMaterial_tyre.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_tyre.png');
+
+				// myMaterial for glass
+				myMaterial_glass = new THREE.ShaderMaterial({	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	uViewMatrixInverse: { type: "m4", value: m },
+														        	pmrem: { type: 't' , value: null },							        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs_glass' ).textContent, 
+															fragmentShader: document.getElementById( 'fs_glass' ).textContent,
+															lights: true,
+															transparent: true
+														});  
+				myMaterial_glass.uniforms.pmrem.value = pmremMap;
+
+				// myMaterial for faro
+				myMaterial_faro = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+
+														        	roughGGX: { type: 'f' , value: 0.2 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.7 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.5 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 1 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_faro.uniforms.cubeMap.value = envCube;
+				myMaterial_faro.uniforms.irrMap.value = irrCube;
+				myMaterial_faro.uniforms.pmrem.value = pmremMap;
+				//myMaterial_faro.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('tyre_normal_highres.png');
+				myMaterial_faro.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_faro.png');
+				myMaterial_faro.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/faro_ant.JPG');
+
+				// myMaterial for faro posteriore
+				myMaterial_faro_post = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.1,0.1,0.1) },
+
+														        	roughGGX: { type: 'f' , value: 0.2 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 1.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.05 },
+														        	//mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 1.0 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.3 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 1 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_faro_post.uniforms.cubeMap.value = envCube;
+				myMaterial_faro_post.uniforms.irrMap.value = irrCube;
+				myMaterial_faro_post.uniforms.pmrem.value = pmremMap;
+				//myMaterial_faro_post.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_faro_post.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('');
+				myMaterial_faro_post.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/faro_posteriore.jpg');
+				//myMaterial_faro_post.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_faro_post.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+
+				// myMaterial per mascherina e sotto paraurti
+				myMaterial_black = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	roughGGX: { type: 'f' , value: 0.75 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.1 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.1 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 0 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_black.uniforms.cubeMap.value = envCube;
+				myMaterial_black.uniforms.irrMap.value = irrCube;
+				myMaterial_black.uniforms.pmrem.value = pmremMap;
+				//myMaterial_black.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_black.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_black.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_black.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_black.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+
+				// myMaterial per logo front e retro
+				myMaterial_logo = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) }, // PLASTIC
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	//rough: { type: 'f' , value: 50.0 }, // 0 completely random microsurfaces, oo perfect mirror								        	
+														        	roughGGX: { type: 'f' , value: 0.1 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 1.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.05 },
+														        	mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.5 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.75 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 1 },
+														        	useDiffMap: { type: 'i' , value: 1 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_logo.uniforms.cubeMap.value = envCube;
+				myMaterial_logo.uniforms.irrMap.value = irrCube;
+				myMaterial_logo.uniforms.pmrem.value = pmremMap;
+				myMaterial_logo.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/logo_normal.png');
+				myMaterial_logo.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/BMW_logoresize.png');
+				//myMaterial_logo.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_logo.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_logo.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('');
+
+				// myMaterial per environment
+				myMaterial_env = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.7,0.7,0.7) },
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	roughGGX: { type: 'f' , value: 0.75 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.0 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.0 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 0 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_env.uniforms.cubeMap.value = envCube;
+				myMaterial_env.uniforms.irrMap.value = irrCube;
+				myMaterial_env.uniforms.pmrem.value = pmremMap;
+				//myMaterial_env.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('');
+				myMaterial_env.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_conca.png');
+				//myMaterial_env.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_env.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_env.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+
+				// myMaterial for rim
+				myMaterial_rim = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },														       	
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) }, // PLASTIC
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	roughGGX: { type: 'f' , value: 0.5 }, // roughness GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.7 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.5 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.5 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 1 },
+														        	useDiffMap: { type: 'i' , value: 1 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 0 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_rim.uniforms.cubeMap.value = envCube;
+				myMaterial_rim.uniforms.irrMap.value = irrCube;
+				myMaterial_rim.uniforms.pmrem.value = pmremMap;
+				myMaterial_rim.uniforms.normalMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/normal_rim.jpg');
+				myMaterial_rim.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/bmw_rim.jpg');
+				myMaterial_rim.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_rim.jpg');
+				myMaterial_rim.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/sp_rim.png');
+				//myMaterial_rim.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_rim.uniforms.noiseMap.value = THREE.ImageUtils.loadTexture('highFreqNormal.png');
+				//myMaterial_rim.uniforms.noiseMap.value.wrapT = myMaterial.uniforms.noiseMap.value.wrapS = THREE.RepeatWrapping;
+				//myMaterial_rim.uniforms.noiseMap.value.magFilter = myMaterial.uniforms.noiseMap.value.minFilter = THREE.NearestFilter;
+				
+
+				// myMaterial for disc
+				myMaterial_disc = new THREE.ShaderMaterial({ 	uniforms: THREE.UniformsUtils.merge([
+														        THREE.UniformsLib['lights'],
+														        THREE.UniformsLib[ "shadowmap" ],
+														        {
+														        	cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.0) },
+														        	//cDiff: { type: 'v3' , value: new THREE.Vector3(0.0,0.0,0.1) },
+														       		//f0: { type: 'v3' , value: new THREE.Vector3(1.0,0.71,0.29) }, // GOLD
+														        	f0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) }, // PLASTIC
+														        	clearcoatF0: { type: 'v3' , value: new THREE.Vector3(0.04,0.04,0.04) },
+
+														        	//rough: { type: 'f' , value: 50.0 }, // 0 completely random microsurfaces, oo perfect mirror								        	
+														        	roughGGX: { type: 'f' , value: 0.5 }, // value of roughness with the D_TrowbridgeReitz GGX (from 0 smooth to 1 rough)
+														        	clearcoat: { type: 'f' , value: 0.0 },
+														        	clearcoatGloss: { type: 'f' , value: 0.1 },
+														        	mipmapIndex: { type: 'f' , value: 0 },
+														        	ambientFactorDiffuse: { type: 'f' , value: 0.5 },
+														        	ambientFactorSpecular: { type: 'f' , value: 0.5 },
+														        	repeat: { type: 'f' , value: 7 },
+														        	sparkleAmount: { type: 'f' , value: 0.5 },
+														        	AOamount: { type: 'f' , value: 1.0 },
+
+														        	useShadowMap: { type: 'i' , value: 0 },
+														        	useNormalMap: { type: 'i' , value: 0 },
+														        	useDiffMap: { type: 'i' , value: 1 },
+														        	useSpecMap: { type: 'i' , value: 0 },
+														        	useGlossMap: { type: 'i' , value: 0 },
+														        	useNoiseMap: { type: 'i' , value: 0 },
+														        	useOcclusionMap: { type: 'i' , value: 1 },
+
+														        	uViewMatrixInverse: { type: "m4", value: m },
+
+														        	cubeMap: { type: 't', value: null },
+														        	irrMap: { type: 't' , value: null },
+														        	pmrem: { type: 't' , value: null },
+														        	normalMap: { type: 't' , value: null },
+																	diffuseMap: { type: 't' , value: null },
+																	specularMap: { type: 't' , value: null },
+																	glossMap: { type: 't' , value: null },
+																	noiseMap: { type: 't' , value: null },
+																	occlusionMap: { type: 't' , value: null}																	
+																								        	
+														        }
+														    ]),
+															vertexShader: document.getElementById( 'vs' ).textContent, 
+															fragmentShader: document.getElementById( 'fs' ).textContent,
+															lights: true
+														});  
+				myMaterial_disc.uniforms.cubeMap.value = envCube;
+				myMaterial_disc.uniforms.irrMap.value = irrCube;
+				myMaterial_disc.uniforms.pmrem.value = pmremMap;
+				myMaterial_disc.uniforms.diffuseMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/bmw_rim.jpg');
+				myMaterial_disc.uniforms.occlusionMap.value = THREE.ImageUtils.loadTexture('../resources/texture/bmw/ao_disc.jpg');
+				//myMaterial_disc.uniforms.specularMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_disc.uniforms.glossMap.value = THREE.ImageUtils.loadTexture('');
+				//myMaterial_disc.uniforms.noiseMap.value = THREE.ImageUtils.loadTexture('highFreqNormal.png');
+				//myMaterial_disc.uniforms.noiseMap.value.wrapT = myMaterial.uniforms.noiseMap.value.wrapS = THREE.RepeatWrapping;
+				//myMaterial_disc.uniforms.noiseMap.value.magFilter = myMaterial.uniforms.noiseMap.value.minFilter = THREE.NearestFilter;
+
+				// ----------------------------------
+
+				// ----------------------------------
+				// CREATE GEOMETRY
+				// ----------------------------------
+				// mesh.geometry.computeTangents() è fondamentale per far calcolare a Three.js le tangenti, in modo da averle disponibili come attribute nel GLSL
+
+				//meshLoaded0.geometry.computeTangents();
+				//meshLoaded0.material = myMaterial;
+
+				meshLoaded1.geometry.computeTangents();
+				meshLoaded1.material = myMaterial;
+
+				//meshLoaded2.geometry.computeTangents();
+				//meshLoaded2.material = myMaterial;
+
+				//meshLoaded3.geometry.computeTangents();
+				//meshLoaded3.material = myMaterial;
+
+				//meshLoaded4.geometry.computeTangents();
+				//meshLoaded4.material = myMaterial;
+
+				meshLoaded5.geometry.computeTangents();
+				meshLoaded5.material = myMaterial_glass;
+
+				//meshLoaded6.geometry.computeTangents();
+				//meshLoaded6.material = myMaterial;
+
+				meshLoaded7.geometry.computeTangents();
+				meshLoaded7.material = myMaterial_glass;
+
+				meshLoaded8.geometry.computeTangents();
+				meshLoaded8.material = myMaterial_glass;
+
+				meshLoaded9.geometry.computeTangents();
+				meshLoaded9.material = myMaterial_glass;
+
+				meshLoaded10.geometry.computeTangents();
+				meshLoaded10.material = myMaterial_chrome;
+
+				meshLoaded11.geometry.computeTangents();
+				meshLoaded11.material = myMaterial_chrome;
+
+				meshLoaded12.geometry.computeTangents();
+				meshLoaded12.material = myMaterial_black;
+
+				meshLoaded14.geometry.computeTangents();
+				meshLoaded14.material = myMaterial_rim;
+
+				meshLoaded15.geometry.computeTangents();
+				meshLoaded15.material = myMaterial_rim;
+
+				meshLoaded16.geometry.computeTangents();
+				meshLoaded16.material = myMaterial_rim;
+
+				meshLoaded17.geometry.computeTangents();
+				meshLoaded17.material = myMaterial_tyre;
+
+				meshLoaded18.geometry.computeTangents();
+				meshLoaded18.material = myMaterial_tyre;
+
+				meshLoaded19.geometry.computeTangents();
+				meshLoaded19.material = myMaterial_tyre;
+
+				meshLoaded20.geometry.computeTangents();
+				meshLoaded20.material = myMaterial_tyre;
+
+				meshLoaded21.geometry.computeTangents();
+				meshLoaded21.material = myMaterial_faro;
+
+				meshLoaded22.geometry.computeTangents();
+				meshLoaded22.material = myMaterial_faro_post;
+
+				//meshLoaded23.geometry.computeTangents();
+				//meshLoaded23.material = myMaterial_faro_post;
+
+				meshLoaded24.geometry.computeTangents();
+				meshLoaded24.material = myMaterial_black;
+
+				meshLoaded25.geometry.computeTangents();
+				meshLoaded25.material = myMaterial_black;
+
+				meshLoaded26.geometry.computeTangents();
+				meshLoaded26.material = myMaterial_logo;
+
+				meshLoaded27.geometry.computeTangents();
+				meshLoaded27.material = myMaterial_logo;
+
+				meshLoaded28.geometry.computeTangents();
+				meshLoaded28.material = myMaterial_env;
+
+				meshLoaded29.geometry.computeTangents();
+				meshLoaded29.material = myMaterial_rim;
+
+				meshLoaded30.geometry.computeTangents();
+				meshLoaded30.material = myMaterial_disc;
+
+				meshLoaded31.geometry.computeTangents();
+				meshLoaded31.material = myMaterial_disc;
+
+				meshLoaded32.geometry.computeTangents();
+				meshLoaded32.material = myMaterial_disc;
+
+				meshLoaded33.geometry.computeTangents();
+				meshLoaded33.material = myMaterial_disc;
+
+				// var sphere = new THREE.Mesh( new THREE.SphereGeometry( 1, 32, 32 ) , myMaterial );
+				// sphere.geometry.computeTangents();
+				// sphere.castShadow = true;
+				// sphere.receiveShadow = true;
+				// sphere.position.x = -2;
+				// scene.add(sphere);
+				// var torusKnot = new THREE.Mesh( new THREE.TorusKnotGeometry( 1.5, 0.3, 128, 32 ) , myMaterial );
+				// torusKnot.geometry.computeTangents();
+				// torusKnot.castShadow = true;
+				// torusKnot.receiveShadow = true;
+				// scene.add(torusKnot);
+ 
+				// var planeGeom = new THREE.PlaneGeometry(10,10);
+				// var plane = new THREE.Mesh( planeGeom , new THREE.MeshPhongMaterial( { color: 0xffffff , side: THREE.DoubleSide } ) );				
+				// plane.position.y = 1.5;
+				// plane.rotation.x = -Math.PI/2;
+				// plane.receiveShadow = true;
+				// scene.add(plane);
+
+				// var cubettoGeom = new THREE.BoxGeometry(1,1,1);
+				// var cubetto = new THREE.Mesh( cubettoGeom , new THREE.MeshPhongMaterial( { color: 0x00ff00 } ) );
+				// cubetto.position.set(1.7,0,0);
+				// cubetto.rotation.z = 40;
+				// cubetto.castShadow = true;
+				// cubetto.receiveShadow = true;
+				// scene.add(cubetto);
+				// ----------------------------------
+
+				// ----------------------------------
+				// POST PROCESSING - SSAO	---> http://www.airtightinteractive.com/2013/02/intro-to-pixel-shaders-in-three-js/
+				// ----------------------------------
+
+				// depth				
+				var depthShader = THREE.ShaderLib[ "depthRGBA" ];
+				var depthUniforms = THREE.UniformsUtils.clone( depthShader.uniforms );
+
+				depthMaterial = new THREE.ShaderMaterial( { fragmentShader: depthShader.fragmentShader, vertexShader: depthShader.vertexShader, uniforms: depthUniforms } );
+				depthMaterial.blending = THREE.NoBlending;
+				//
+
+				composer = new THREE.EffectComposer( renderer );
+				composer.addPass( new THREE.RenderPass( scene, camera ) );
+
+				depthTarget = new THREE.WebGLRenderTarget( window.innerWidth, window.innerHeight, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, format: THREE.RGBAFormat } );
+
+				var mySSAOShader = {
+									uniforms: {
+
+										"tDiffuse":     { type: "t", value: null },
+										"tDepth":       { type: "t", value: null },
+										"size":         { type: "v2", value: new THREE.Vector2( 512, 512 ) },
+										"cameraNear":   { type: "f", value: 1 },
+										"cameraFar":    { type: "f", value: 1000 }
+
+									},
+
+									vertexShader: [
+
+										"varying vec2 vUv;",
+
+										"void main() {",
+
+											"vUv = uv;",
+											"gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );",
+
+										"}"
+
+									].join("\n"),
+
+									fragmentShader: [
+
+										"uniform sampler2D tDiffuse;",
+										"uniform sampler2D tDepth;",
+										"uniform float cameraNear;",
+										"uniform float cameraFar;",
+										"varying vec2 vUv;",
+
+										// RGBA depth
+										"float unpackDepth( const in vec4 rgba_depth ) {",
+
+											"const vec4 bit_shift = vec4( 1.0 / ( 256.0 * 256.0 * 256.0 ), 1.0 / ( 256.0 * 256.0 ), 1.0 / 256.0, 1.0 );",
+											"float depth = dot( rgba_depth, bit_shift );",
+											"return depth;",
+
+										"}",
+
+										"float readDepth( const in vec2 coord ) {",
+											"return ( 2.0 * cameraNear ) / ( cameraFar + cameraNear - unpackDepth( texture2D( tDepth, coord ) ) * ( cameraFar - cameraNear ) );",
+										"}",
+
+										"void main() {",
+
+											"float depth = readDepth( vUv );",
+
+											"vec4 color = texture2D(tDiffuse, vUv);",
+											"vec4 showDepths = texture2D( tDepth, vUv );",
+											"gl_FragColor = vec4( vec3(showDepths) , 1.0);",
+										"}"
+
+									].join("\n")
+
+									};
+				
+				var effect = new THREE.ShaderPass( THREE.SSAOShader );
+				effect.uniforms[ 'tDepth' ].value = depthTarget;
+				effect.uniforms[ 'size' ].value.set( window.innerWidth, window.innerHeight );
+				effect.uniforms[ 'cameraNear' ].value = 0.01;	// Usare valori più piccoli possibili, altrimenti si ha poca precisione 
+				effect.uniforms[ 'cameraFar' ].value = 10;		// (discorso simile alla shadowMap)
+				effect.uniforms[ 'onlyAO' ].value = false;
+				effect.renderToScreen = true;
+				composer.addPass( effect );
+				// ----------------------------------
+
+				// ----------------------------------
+				// LIGHTS
+				// ----------------------------------
+				light = new THREE.DirectionalLight(0xffffff);
+				light.position.set(5,5,2);
+				light.shadowMapWidth = 1024;
+				light.shadowMapHeight = 1024;
+				light.shadowMapCullFrontFaces = false;	// di default è true, il che vuol dire che taglierebbe le front faces calcolando l'ombra sulle back faces, ma lo shader non ha back faces
+				light.castShadow = true;
+				light.shadowDarkness = 1.0;
+				light.shadowBias = 0.0;
+				var d = 2;
+				light.shadowCameraVisible = false;	// for avoid 'Peter Panning' make the near plane so far away from the light
+				light.shadowCameraNear = 5;		    // and the far plane so close as possible.		
+				light.shadowCameraFar = 9;			// Doing so increases the effective precision of the Z-buffer
+				light.shadowCameraLeft = -d;
+				light.shadowCameraRight = d;
+				light.shadowCameraTop = d;
+				light.shadowCameraBottom = -d;
+				scene.add(light);
+				// ----------------------------------
+
+				// ----------------------------------
+				// ENVIRONMENT BOX
+				// ----------------------------------
+				// var shader = THREE.ShaderLib["cube"];
+				// var uniforms = THREE.UniformsUtils.clone( shader.uniforms );
+				// uniforms['tCube'].value = envCube;
+				// var material = new THREE.ShaderMaterial({
+				//     fragmentShader    : shader.fragmentShader,
+				//     vertexShader  : shader.vertexShader,
+				//     uniforms  : uniforms,
+				//     side: THREE.BackSide	// DoubleSide or BackSide
+				// });
+				// //var skyboxMesh = new THREE.Mesh( new THREE.BoxGeometry( 1000, 1000, 1000), new THREE.MeshLambertMaterial({ color: 0xffffff , side: THREE.BackSide }) );
+				// var skyboxMesh = new THREE.Mesh( new THREE.BoxGeometry( 1000, 1000, 1000), material );
+				// //skyboxMesh.position.y = 490;
+				// skyboxMesh.receiveShadow = true;
+				// scene.add(skyboxMesh);
+				// ----------------------------------
+
+			} // chiude init()
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function hexToRgb(hex) {
+			    // Expand shorthand form (e.g. "03F") to full form (e.g. "0033FF")
+			    var shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+			    hex = hex.replace(shorthandRegex, function(m, r, g, b) {
+			        return r + r + g + g + b + b;
+			    });
+
+			    var result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+			    return result ? {
+			        r: parseInt(result[1], 16),
+			        g: parseInt(result[2], 16),
+			        b: parseInt(result[3], 16)
+			    } : null;
+			}
+
+			function componentToHex(c) {
+			    var hex = c.toString(16);
+			    return hex.length == 1 ? "0" + hex : hex;
+			}
+
+			function rgbToHex(r, g, b) {
+			    return "#" + componentToHex(r) + componentToHex(g) + componentToHex(b);
+			}
+
+			function setupGui() {
+
+				effectController = {
+					cDiff: "#000000",
+					f0: "#3c3c3c",
+					f0_r: 0.04,
+					f0_g: 0.04,
+					f0_b: 0.04,
+					F0preset: "None",
+					roughGGX: 0.3,
+					ambientFactorDiffuse: 0.5,
+					ambientFactorSpecular: 0.5,
+					clearcoat: 0.04,
+					clearcoatGloss: 0.1,
+					useShadowMap: false,
+					useNormalMap: false,
+					useDiffMap: false,
+					useSpecMap: false,
+					useGlossMap: false,
+					useNoiseMap: false,
+					useOcclusionMap: false,
+					AOamount: 0.7,
+					repeat: 100,
+					sparkleAmount: 0.09,
+					useSSAO: false,
+					lightBias: 0.005	//il valore buono sarebbe -0.005 , ma in quel caso non si vedono le cifre sulla GUI! (BUG)
+				};
+
+				var gui = new dat.GUI();
+				gui.width = 325;
+
+				var menuMaterial;
+				menuMaterial = gui.addFolder("Material settings");
+				menuMaterial.addColor( effectController, "cDiff").name("Albedo");
+				menuMaterial.addColor( effectController, "f0").name("F0");
+				menuMaterial.add( effectController, "F0preset", [ "None", "Plastic", "Iron", "Copper", "Gold", "Aluminum", "Silver" ] ).name('F0 preset');
+				menuMaterial.add( effectController, "roughGGX", 0.0, 1.0, 0.01).name("GGX Roughness");
+				menuMaterial.add( effectController, "ambientFactorDiffuse", 0.0, 1.0, 0.01).name("Ambient Diffuse");
+				menuMaterial.add( effectController, "ambientFactorSpecular", 0.0, 1.0, 0.01).name("Ambient Specular");
+
+				var menuClearcoat;
+				menuClearcoat = gui.addFolder("Clearcoat settings");
+				menuClearcoat.add( effectController, "clearcoat", 0.0, 1.0, 0.01).name("Clearcoat Intensity");
+				menuClearcoat.add( effectController, "clearcoatGloss", 0.0, 1.0, 0.0001).name("Clearcoat Glossiness");
+				menuClearcoat.add( effectController, "f0_r", 0.04, 0.35, 0.01).name("f0 red");
+				menuClearcoat.add( effectController, "f0_g", 0.04, 0.35, 0.01).name("f0 green");
+				menuClearcoat.add( effectController, "f0_b", 0.04, 0.35, 0.01).name("f0 blue");
+
+				var menuShadow;
+				menuShadow = gui.addFolder("ShadowMap settings");
+				menuShadow.add( effectController, "useShadowMap" ).name("Enable shadowMap");				
+				menuShadow.add( effectController, "lightBias", -0.01, 0.01, 0.001).name("Light Bias");
+
+				gui.add( effectController, "useNormalMap" ).name("Enable NormalMap");
+				gui.add( effectController, "useDiffMap" ).name("Enable DiffuseMap");
+				gui.add( effectController, "useSpecMap" ).name("Enable SpecularMap");
+				gui.add( effectController, "useGlossMap" ).name("Enable GlossMap");
+				gui.add( effectController, "useOcclusionMap" ).name("Enable OcclusionMap");
+				gui.add( effectController, "AOamount", 0.0, 1.0, 0.1).name("Occlusion Amount");
+
+				var menuSparkles;
+				menuSparkles = gui.addFolder("Sparkle settings");
+				menuSparkles.add( effectController, "useNoiseMap" ).name("Enable Sparkle");
+				menuSparkles.add( effectController, "repeat", 1.0, 100, 1.0).name("Repeat");
+				menuSparkles.add( effectController, "sparkleAmount", 0.0, 1.0, 0.1).name("Sparkle Amount");
+				
+				//gui.add( effectController, "useSSAO" ).name("Enable SSAO");
+
+			}
+
+			function animate() {
+
+				requestAnimationFrame( animate );
+
+				controls.update();
+
+				if(effectController.useShadowMap == true){ 
+					myMaterial.uniforms.useShadowMap.value = 1; 
+					myMaterial_chrome.uniforms.useShadowMap.value = 1;
+					myMaterial_tyre.uniforms.useShadowMap.value = 1;
+					myMaterial_rim.uniforms.useShadowMap.value = 1;
+					myMaterial_faro.uniforms.useShadowMap.value = 1;
+					myMaterial_faro_post.uniforms.useShadowMap.value = 1;
+					myMaterial_env.uniforms.useShadowMap.value = 1;
+					myMaterial_black.uniforms.useShadowMap.value = 1;
+					myMaterial_disc.uniforms.useShadowMap.value = 1;
+					myMaterial_logo.uniforms.useShadowMap.value = 1;
+				}else{ 
+					myMaterial.uniforms.useShadowMap.value = 0; 
+					myMaterial_chrome.uniforms.useShadowMap.value = 0;
+					myMaterial_tyre.uniforms.useShadowMap.value = 0;
+					myMaterial_rim.uniforms.useShadowMap.value = 0;
+					myMaterial_faro.uniforms.useShadowMap.value = 0;
+					myMaterial_faro_post.uniforms.useShadowMap.value = 0;
+					myMaterial_env.uniforms.useShadowMap.value = 0;
+					myMaterial_black.uniforms.useShadowMap.value = 0;
+					myMaterial_disc.uniforms.useShadowMap.value = 0;
+					myMaterial_logo.uniforms.useShadowMap.value = 0;
+				}
+				if(effectController.useNormalMap == true){ myMaterial.uniforms.useNormalMap.value = 1; }else{ myMaterial.uniforms.useNormalMap.value = 0; }
+				if(effectController.useDiffMap == true){ myMaterial.uniforms.useDiffMap.value = 1; }else{ myMaterial.uniforms.useDiffMap.value = 0; }
+				if(effectController.useSpecMap == true){ myMaterial_rim.uniforms.useSpecMap.value = 1; }else{ myMaterial_rim.uniforms.useSpecMap.value = 0; }
+				if(effectController.useGlossMap == true){ myMaterial.uniforms.useGlossMap.value = 1; }else{ myMaterial.uniforms.useGlossMap.value = 0; }
+				if(effectController.useNoiseMap == true){ myMaterial.uniforms.useNoiseMap.value = 1; }else{ myMaterial.uniforms.useNoiseMap.value = 0; }
+				if(effectController.useOcclusionMap == true){ 
+					myMaterial.uniforms.useOcclusionMap.value = 1;
+					myMaterial_faro.uniforms.useOcclusionMap.value = 1;
+					myMaterial_rim.uniforms.useOcclusionMap.value = 1;
+					myMaterial_tyre.uniforms.useOcclusionMap.value = 1;
+					myMaterial_env.uniforms.useOcclusionMap.value = 1;
+					myMaterial.uniforms.AOamount.value = effectController.AOamount;
+					myMaterial_faro.uniforms.AOamount.value = effectController.AOamount;
+					myMaterial_rim.uniforms.AOamount.value = effectController.AOamount;
+					myMaterial_tyre.uniforms.AOamount.value = effectController.AOamount;
+					myMaterial_env.uniforms.AOamount.value = effectController.AOamount;
+				 }else{ 
+				 	myMaterial.uniforms.useOcclusionMap.value = 0;
+				 	myMaterial_faro.uniforms.useOcclusionMap.value = 0;
+				 	myMaterial_tyre.uniforms.useOcclusionMap.value = 0;
+				 	myMaterial_env.uniforms.useOcclusionMap.value = 0;
+				 	myMaterial_rim.uniforms.useOcclusionMap.value = 0; 
+				 }
+
+				var sliderDiffColor = hexToRgb(effectController.cDiff);
+				myMaterial.uniforms.cDiff.value.x = ( Math.pow(sliderDiffColor.r/255.0, 2.2 ) ).toFixed(9);				
+				myMaterial.uniforms.cDiff.value.y = ( Math.pow(sliderDiffColor.g/255.0, 2.2 ) ).toFixed(9);
+				myMaterial.uniforms.cDiff.value.z = ( Math.pow(sliderDiffColor.b/255.0, 2.2 ) ).toFixed(9);
+				var sliderF0Color = hexToRgb(effectController.f0);
+				// myMaterial.uniforms.f0.value.x = ( Math.pow(sliderF0Color.r/255.0, 2.2 ) ).toFixed(9);
+				// myMaterial.uniforms.f0.value.y = ( Math.pow(sliderF0Color.g/255.0, 2.2 ) ).toFixed(9);
+				// myMaterial.uniforms.f0.value.z = ( Math.pow(sliderF0Color.b/255.0, 2.2 ) ).toFixed(9);
+				myMaterial.uniforms.roughGGX.value = effectController.roughGGX;
+				myMaterial.uniforms.ambientFactorDiffuse.value = effectController.ambientFactorDiffuse;
+				myMaterial.uniforms.ambientFactorSpecular.value = effectController.ambientFactorSpecular;
+
+				//  F0 PRESET
+				var preset = effectController.F0preset;
+				if( preset=="Plastic" ){
+					myMaterial.uniforms.f0.value.x = (0.04);
+					myMaterial.uniforms.f0.value.y = (0.04);
+					myMaterial.uniforms.f0.value.z = (0.04);
+					//effectController.f0 = rgbToHex(0.04,0.04,0.04);
+				}else if( preset=="Iron" ){
+					myMaterial.uniforms.f0.value.x = (0.56);
+					myMaterial.uniforms.f0.value.y = (0.57);
+					myMaterial.uniforms.f0.value.z = (0.58);
+				}else if( preset=="Copper" ){
+					myMaterial.uniforms.f0.value.x = (0.95);
+					myMaterial.uniforms.f0.value.y = (0.64);
+					myMaterial.uniforms.f0.value.z = (0.54);
+				}else if( preset=="Gold" ){
+					myMaterial.uniforms.f0.value.x = (1.0);
+					myMaterial.uniforms.f0.value.y = (0.71);
+					myMaterial.uniforms.f0.value.z = (0.29);
+				}else if( preset=="Aluminum" ){
+					myMaterial.uniforms.f0.value.x = (0.91);
+					myMaterial.uniforms.f0.value.y = (0.92);
+					myMaterial.uniforms.f0.value.z = (0.92);
+				}else if( preset=="Silver" ){
+					myMaterial.uniforms.f0.value.x = (0.95);
+					myMaterial.uniforms.f0.value.y = (0.93);
+					myMaterial.uniforms.f0.value.z = (0.88);
+				}else if( preset=="None" ){
+					var sliderF0Color = hexToRgb(effectController.f0);
+					myMaterial.uniforms.f0.value.x = ( Math.pow(sliderF0Color.r/255.0, 2.2 ) ).toFixed(9);
+					myMaterial.uniforms.f0.value.y = ( Math.pow(sliderF0Color.g/255.0, 2.2 ) ).toFixed(9);
+					myMaterial.uniforms.f0.value.z = ( Math.pow(sliderF0Color.b/255.0, 2.2 ) ).toFixed(9);
+				}
+
+				myMaterial.uniforms.clearcoat.value = effectController.clearcoat;
+				myMaterial.uniforms.clearcoatGloss.value = effectController.clearcoatGloss;
+				myMaterial.uniforms.clearcoatF0.value.x = effectController.f0_r;
+				myMaterial.uniforms.clearcoatF0.value.y = effectController.f0_g;
+				myMaterial.uniforms.clearcoatF0.value.z = effectController.f0_b;
+
+				myMaterial.uniforms.repeat.value = effectController.repeat;
+				myMaterial.uniforms.sparkleAmount.value = effectController.sparkleAmount;
+
+				// passaggio di uViewMatrixInverse
+				myMaterial.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_chrome.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_tyre.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_glass.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_faro.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_faro_post.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_black.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_logo.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_env.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_rim.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+				myMaterial_disc.uniforms.uViewMatrixInverse.value = camera.matrixWorld;
+
+				light.shadowBias = effectController.lightBias;
+
+				// if(effectController.useSSAO == true){ 	
+
+				// 	scene.overrideMaterial = depthMaterial;
+				// 	renderer.render( scene, camera, depthTarget, true );
+
+				// 	scene.overrideMaterial = null;
+				// 	composer.render();
+				
+				// }else{ 
+
+				// 	renderer.render( scene, camera ); 
+				// }		
+
+				renderer.render( scene, camera );		
+
+				stats.update();
+			}
+
+		</script>
+	</body>
+</html>

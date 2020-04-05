@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>Testing</title>
+		<style>
+			html, body {
+				width: 100%;
+				height: 100%;
+			}
+
+			body {
+				background-color: #ffffff;
+				margin: 0;
+				overflow: hidden;
+				font-family: arial;
+			}
+
+		</style>
+
+		<script id="vs" type="x-shader/x-vertex">			
+			uniform vec3 directionalLightDirection;
+			varying vec3 lightDir;
+			varying vec3 vNormal;
+			varying vec3 vPosition;	
+			varying vec2 vUv;	
+
+		    void main() {
+
+		    	vUv = uv;
+		    	lightDir = normalize( vec3( ( viewMatrix * vec4(directionalLightDirection,0.0) ) ) );
+		    	vNormal = normalize(normalMatrix * normal);
+		    	vPosition = vec3( modelViewMatrix*vec4(position,1.0) );
+
+		        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+		    }
+		</script>
+
+		<script id="fs" type="x-shader/x-fragment">
+			uniform vec3 directionalLightDirection;
+			uniform vec3 directionalLightColor;
+			uniform vec3 uMatColor;
+			uniform vec3 ambientLightColor;
+			uniform float kd, ks, shin;
+			uniform float ambientFactor;
+			uniform sampler2D imgText;
+			varying vec3 lightDir;
+			varying vec3 vNormal;
+			varying vec3 vPosition;	
+			varying vec2 vUv;
+
+	        void main() {	        	 
+				vec3 color;				
+				vec3 eye = -vPosition;
+		    	vec3 halfVec = normalize( normalize(eye) + lightDir );
+
+				color = ambientFactor*ambientLightColor;
+
+				if (dot(lightDir, vNormal) > 0.0) {
+		    		
+		    		vec3 specColor = ks * pow( max( dot( vNormal , halfVec) , 0.0) , shin ) * vec3(1.0,1.0,1.0);
+		    		color += kd * dot(lightDir, vNormal) * uMatColor * directionalLightColor + specColor;
+		    	}				
+
+	            //gl_FragColor = vec4(color,1.0);
+	            vec4 texel = texture2D(imgText, vUv);
+	            gl_FragColor = texel;
+	        }
+	    </script>
+	</head>
+
+	<body>
+		<script src="../libs/three.min.js"></script>
+		<script src="../libs/OrbitControls.js"></script>
+        <script src="../libs/dat.gui.min.js"></script>
+        
+        <script src="../js/tests.js"></script>
+	</body>
+</html>
